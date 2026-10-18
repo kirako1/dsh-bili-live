@@ -1,0 +1,19 @@
+# 运行时不进仓库
+node_modules/
+*.log
+
+# 本地配置与登录态（含 SESSDATA，绝不能提交）
+config.json
+credential.json
+state.json
+pushed.json
+
+# 运行时产物
+recaps/
+tmp/
+
+# 备份与系统垃圾
+*.bak
+*.bak-*
+.DS_Store
+Thumbs.db
