@@ -440,33 +440,6 @@ window.__ModuleLoader__.load({
         setRowInfo(swap)
       }
 
-      const saveRows = async () => {
-        setBusy('save')
-        try {
-          const next = []
-          for (let i = 0; i < rows.length; i++) {
-            const k = (rows[i] || '').trim()
-            if (!k) continue
-            let hit = rowInfo[i]?.stream ? rowInfo[i] : null
-            if (!hit) {
-              hit = await lookup(k)
-              if (!hit) { setMsg({ tone: 'warn', text: `第 ${i + 1} 行没查到：${k}` }); return }
-              patchRow(i, hit)
-            }
-            if (next.some((s) => String(s.roomId) === String(hit.stream.roomId))) continue
-            next.push({ ...hit.stream, enabled: true })
-          }
-          const r = await jpost('/config', { streams: next })
-          setForm(r.config)
-          setSt((s) => ({ ...s, config: r.config }))
-          applyRows(r.config)
-          setMsg({ tone: 'good', text: next.length ? `已保存 ${next.length} 位主播，第 1 行最优先` : '已清空，不再守任何直播间' })
-          refresh()
-        } catch (e) {
-          setMsg({ tone: 'warn', text: '保存失败：' + (e?.message || e) })
-        } finally { setBusy('') }
-      }
-
       /* ── 扫码登录 ── */
       const startLogin = async () => {
         setQrBusy(true)
@@ -866,7 +839,7 @@ window.__ModuleLoader__.load({
         /* ── 主播评分 ── */
         h('div', { 'data-bl-sec': '' },
           h('div', { 'data-bl-h': '' }, '主播评分'),
-          h('div', { 'data-bl-note': '' }, '随机巡场进来的直播间，看满时长后给主播打分（满分 10）：同接、发言人数、弹幕密度、月投稿数、付费、获赞率、大航海、互动率八项，各自按量级归一后加权。分数会写进直播笔记；关注名单里的主播是特意守的，不打分、不推送。'),
+          h('div', { 'data-bl-note': '' }, '看满时长后给主播打分（满分 10）：同接、发言人数、弹幕密度、月投稿数、付费、获赞率、大航海、互动率八项，各自按量级归一后加权。分数会写进直播笔记。随机巡场和关注名单里的主播都会打分，区别在推送——只有随机巡场进来的、分数超过下面那条线的才发私信；关注的主播是特意守的，分数只留在笔记里。'),
           h(ToggleRow, {
             label: '下播后给主播打分',
             note: '关掉就不算分，也不会有高分推送',

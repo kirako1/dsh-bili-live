@@ -429,8 +429,8 @@ export function apply(ctx) {
       }
     }
 
-    // ② 分数过线就推送
-    if (rating && rating.score > cfg.ratingPushScore) {
+    // ② 分数过线就推送。只有随机巡场进来的才推；关注名单里的主播哪怕 10 分，也只在笔记里留个分
+    if (rating && rec.random && rating.score > cfg.ratingPushScore) {
       await pushHighlight(rec, rating, summary).catch((e) => log(`高分推送出错：${e?.message ?? e}`))
     }
 
@@ -809,6 +809,8 @@ export function apply(ctx) {
       onLog: (m) => log(m),
     })
     rt.recorder = recorder
+    // 记下这场是「随机巡场」还是「守关注名单」——推送只对随机巡场开
+    recorder.random = Boolean(opts?.random)
     rt.current = {
       realRoomId,
       uname: info.uname || stream.name,
@@ -824,10 +826,10 @@ export function apply(ctx) {
     await client.start()
     startAudio(realRoomId, cred)
     startVision(realRoomId, cred)
-    // 关注名单里的主播只看不打分；只有随机巡场进来的才评分
+    // 评分：随机巡场和关注名单里的主播都打分（关注的主播只是不推送，见 finishRecap ②）
+    startRating(realRoomId, info.uid || stream.mid || '', cred)
     if (opts?.random) {
-      startRating(realRoomId, info.uid || stream.mid || '', cred)
-      // 看够 randomWatchMs 就收摊换人：先结这场（写笔记+评分+推送），再让 tick 挑下一个
+      // 看够 randomWatchMs 就收摊换人：先结这场（写笔记+评分），再让 tick 挑下一个
       const watchMs = Math.max(60_000, Number(cfg.randomWatchMs) || 1_800_000)
       clearTimeout(rt.rotateTimer)
       rt.rotateTimer = setTimeout(() => {
@@ -836,8 +838,6 @@ export function apply(ctx) {
         stopWatching(`巡场看满 ${mins} 分钟`)
         tick().catch(() => {})
       }, watchMs)
-    } else {
-      stopRating()
     }
   }
 
