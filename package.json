@@ -1,7 +1,7 @@
 {
   "name": "dsh-bili-live",
   "version": "0.9.1",
-  "description": "B站直播助手：自动巡场看直播、听声音看画面、写直播笔记、给主播打分",
+  "description": "B站直播助手（DD版）：自动巡场看直播、听声音看画面、写直播笔记、给主播打分",
   "keywords": [
     "dsh",
     "dsh-plugin",
