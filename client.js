@@ -544,7 +544,7 @@ window.__ModuleLoader__.load({
         /* ── 状态 ── */
         h('div', { 'data-bl-hero': '' },
           h('div', { 'data-bl-hero-top': '' },
-            h('span', { 'data-bl-title': '' }, '直播总结'),
+            h('span', { 'data-bl-title': '' }, '直播助手（DD版）'),
             h('span', { 'data-bl-pill': '', 'data-tone': tone },
               tone === 'live' ? h('span', { 'data-bl-dot': '' }) : null, pillText),
             h('span', { 'data-bl-note': '', style: { marginLeft: 'auto' } }, 'v' + (st.version || '?'))),
@@ -706,12 +706,12 @@ window.__ModuleLoader__.load({
             h('button', { 'data-bl-btn': '', disabled: busy === 'send' || !st.current, onClick: sendTest }, busy === 'send' ? '发送中…' : '试发一条'),
             h('div', { 'data-bl-grow': '' },
               h('div', { 'data-bl-note': '', style: { textAlign: 'right' } },
-                st.llm?.available ? '自由回复和直播总结都靠它' : '宿主没提供 llm，会退化成固定话术'))),
+                st.llm?.available ? '自由回复和直播助手都靠它' : '宿主没提供 llm，会退化成固定话术'))),
 
         /* ── 听声音 ── */
         h('div', { 'data-bl-sec': '' },
           h('div', { 'data-bl-h': '' }, '听直播的声音'),
-          h('div', { 'data-bl-note': '', style: { margin: '2px 0 12px' } }, '一边看一边把主播说的话转成文字，全程在本机跑、不联网。直播总结会带上它；命中你设的关键词时，还可以像观众那样接一句。改完下面的数字，滚到最底部点「保存全部设置」。'),
+          h('div', { 'data-bl-note': '', style: { margin: '2px 0 12px' } }, '一边看一边把主播说的话转成文字，全程在本机跑、不联网。直播助手会带上它；命中你设的关键词时，还可以像观众那样接一句。改完下面的数字，滚到最底部点「保存全部设置」。'),
           h(ToggleRow, {
             label: '听直播里的声音',
             note: st.audio?.listening
@@ -754,7 +754,7 @@ window.__ModuleLoader__.load({
             onChange: (v) => save({ audioReply: v }, v ? '已开启听声回复' : '已关闭听声回复'),
           }),
           h(ToggleRow, {
-            label: '把主播说的话写进直播总结',
+            label: '把主播说的话写进直播助手',
             note: '总结会参考语音转写的内容（转写可能有错字，只当语境）；关掉就只用弹幕',
             on: form.audioInRecap !== false,
             onChange: (v) => save({ audioInRecap: v }, v ? '总结会参考主播说的话' : '总结只看弹幕'),
@@ -898,7 +898,7 @@ window.__ModuleLoader__.load({
             label: h('span', {},
               '审核恶意内容（实验性功能）',
               h('span', { style: { color: '#e5484d', fontWeight: 600 } }, '（慎开）')),
-            note: '弹幕里出现带节奏、网暴、粗鄙语言，超过下面的条数就扣分（最多 5 分）；本场只要有封禁（房管或主播封过人），就一律不扣分——接口不给封禁原因，分不清封的是恶意弹幕还是刷广告的，所以碰到「弹幕确实脏、但有人封过」时，大肥鱼会在评价里如实交代一句：看到了不干净的内容，但现场已经处理，这次先不扣分。判定前会先分清是开玩笑还是真恶意，拿不准的不算。需要扣分时只写在评分日志和笔记的算式里，不会出现在直播总结正文中',
+            note: '弹幕里出现带节奏、网暴、粗鄙语言，超过下面的条数就扣分（最多 5 分）；本场只要有封禁（房管或主播封过人），就一律不扣分——接口不给封禁原因，分不清封的是恶意弹幕还是刷广告的，所以碰到「弹幕确实脏、但有人封过」时，大肥鱼会在评价里如实交代一句：看到了不干净的内容，但现场已经处理，这次先不扣分。判定前会先分清是开玩笑还是真恶意，拿不准的不算。需要扣分时只写在评分日志和笔记的算式里，不会出现在直播助手正文中',
             on: form.moderationEnabled !== false,
             onChange: (v) => save({ moderationEnabled: v }, v ? '已开启恶意内容审核' : '已关闭恶意内容审核'),
           }),
@@ -1025,7 +1025,7 @@ window.__ModuleLoader__.load({
         if (!e) return this.props.children
         const text = String((e && (e.stack || e.message)) || e)
         return h('div', { 'data-bl-page': '' },
-          h('div', { 'data-bl-msg': '' }, '「直播总结」面板渲染时出错了 —— 把下面这段发给我就能定位：'),
+          h('div', { 'data-bl-msg': '' }, '「直播助手」面板渲染时出错了 —— 把下面这段发给我就能定位：'),
           h('pre', { style: { whiteSpace: 'pre-wrap', fontSize: '11px', lineHeight: 1.5, opacity: 0.85 } }, text))
       }
     }
@@ -1055,7 +1055,7 @@ window.__ModuleLoader__.load({
         if (!slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function') return
         try {
           slots.inject('settings.section', () => slots.register(
-            { name: 'settings.section', id: 'bili-live', order: 31, label: '直播总结' },
+            { name: 'settings.section', id: 'bili-live', order: 31, label: '直播助手（DD版）' },
             () => h(Boundary, null, h(Panel)),
           ))
         } catch (e) {
