@@ -138,14 +138,15 @@ window.__ModuleLoader__.load({
         h(Switch, { on, onChange }))
     }
 
-    /** 八维权重的默认值与中文名（与 lib/rating.mjs 的 DEFAULT_WEIGHTS 保持一致） */
+    /** 十维权重的默认值与中文名（与 lib/rating.mjs 的 WEIGHTS 保持一致；顺序即设置页顺序） */
     const WEIGHT_DEFAULTS = {
-      online: 15, speakers: 10, danmaku: 20, posts: 20,
-      payer: 10, guard: 15, likeRate: 5, interaction: 5,
+      likeRate: 10, interaction: 17, speakerRate: 12, danmaku: 7, online: 5,
+      fansDensity: 12, posts: 8, fansPayRate: 20, strangerPayRate: 8, fanGainRate: 1,
     }
     const WEIGHT_LABELS = {
-      online: '同接', speakers: '发言人数', danmaku: '弹幕密度', posts: '月投稿',
-      payer: '付费人数', guard: '大航海', likeRate: '获赞率', interaction: '互动率',
+      likeRate: '作品获赞', interaction: '直播互动', speakerRate: '观众参与', danmaku: '弹幕热度',
+      online: '人气规模', fansDensity: '粉丝浓度', posts: '更新频率', fansPayRate: '粉丝付费率',
+      strangerPayRate: '路人付费率', fanGainRate: '路人转化率',
     }
 
     /** 权重表：直接读后端 status.weights（已按用户设置归一），改权重只需要动这一处 */
@@ -157,7 +158,7 @@ window.__ModuleLoader__.load({
       const maxW = Math.max(...rows.map((x) => Number(x.weight) || 0), 0.01)
       return h('div', { style: { marginTop: '10px' } },
         h('div', { 'data-bl-note': '', style: { marginBottom: '5px' } },
-          '当前实际生效的权重（每项先按满分线做对数归一，再按上面的比例加权，八项合计 100%）'),
+          '当前实际生效的权重（比率项先换算成「实测 ÷ 同规模期望值」，再按上面的比例加权，十项合计 100%）'),
         ...rows.map((x) => h('div', {
           style: { display: 'flex', alignItems: 'center', gap: '8px', padding: '2px 0' },
         },
@@ -171,9 +172,7 @@ window.__ModuleLoader__.load({
             },
           })),
         h('span', { style: { width: '36px', flex: '0 0 36px', textAlign: 'right', fontSize: '12px', fontWeight: 'bold' } },
-          `${Math.round((Number(x.weight) || 0) * 100)}%`),
-        h('span', { style: { width: '78px', flex: '0 0 78px', textAlign: 'right', fontSize: '11px', opacity: 0.6 } },
-          `满分 ${x.cap}${x.unit || ''}`)))
+          `${Math.round((Number(x.weight) || 0) * 100)}%`)))
       )
     }
 
@@ -197,6 +196,7 @@ window.__ModuleLoader__.load({
       const [rows, setRows] = React.useState([''])
       const [rowInfo, setRowInfo] = React.useState([null])
       const [logOpen, setLogOpen] = React.useState(false)
+      const [switchKey, setSwitchKey] = React.useState('') // 手动切台：房间号或主播 UID
       const [qr, setQr] = React.useState(null)        // { key, svg }
       const [qrMsg, setQrMsg] = React.useState('')
       const [qrBusy, setQrBusy] = React.useState(false)
@@ -325,13 +325,16 @@ window.__ModuleLoader__.load({
         dailyLimit: Number(form.dailyLimit) || 0,
         pollMs: Number(form.pollMs) || 60000,
         priorityEnabled: form.priorityEnabled !== false,
+        randomWhenNoneLive: form.randomWhenNoneLive !== false,
         randomWatchMs: Number(form.randomWatchMs) || 1_800_000,
         /* 随机逛的喜好关键词 + 评分推送：也都只在本地 form 里改，必须一起提交 */
         randomKeywords: Array.isArray(form.randomKeywords) ? form.randomKeywords : [],
         ratingEnabled: form.ratingEnabled !== false,
+        moderationEnabled: form.moderationEnabled !== false,
+        moderationThreshold: Number(form.moderationThreshold) || 10,
         ratingPushScore: Number(form.ratingPushScore) || 8,
         ratingPushUid: String(form.ratingPushUid || ''),
-        /* 八维评分权重：用户在上面自己填的百分数，必须一起提交 */
+        /* 十维评分权重：用户在上面自己填的百分数，必须一起提交 */
         ratingWeights: (() => {
           const src = form.ratingWeights && typeof form.ratingWeights === 'object' ? form.ratingWeights : {}
           const out = {}
@@ -343,7 +346,7 @@ window.__ModuleLoader__.load({
         })(),
         /* 声音区：这些输入框只改本地 form，必须一起提交，否则点保存等于没改 */
         listenAudio: form.listenAudio === true,
-        asrModel: String(form.asrModel || 'medium'),
+        asrModel: String(form.asrModel || 'small'),
         asrLang: String(form.asrLang || 'auto'),
         audioKeywords: Array.isArray(form.audioKeywords) ? form.audioKeywords : [],
         audioReply: form.audioReply !== false,
@@ -509,6 +512,30 @@ window.__ModuleLoader__.load({
         } finally { setBusy('') }
       }
 
+      /* 手动切台：随机换一个 —— 不用等看满设定时长 */
+      const switchRandom = async () => {
+        setBusy('switch')
+        try {
+          const r = await jpost('/switch', { mode: 'random' })
+          if (!r.ok) setMsg({ tone: 'warn', text: '没换成：' + (r.error || '未知原因') })
+          else setMsg({ tone: 'good', text: r.current ? `换到了「${r.current.uname}」` : '现在没有正在播的直播间' })
+          refresh()
+        } catch (e) { setMsg({ tone: 'warn', text: '换台失败：' + (e?.message || e) }) } finally { setBusy('') }
+      }
+
+      /* 手动切台：直接进指定直播间（房间号或主播 UID 都行） */
+      const switchTo = async () => {
+        const key = String(switchKey || '').trim()
+        if (!key) return setMsg({ tone: 'warn', text: '先填一个房间号或主播 UID' })
+        setBusy('switchTo')
+        try {
+          const r = await jpost('/switch', { key })
+          if (!r.ok) setMsg({ tone: 'warn', text: r.error || '进不去这个直播间' })
+          else setMsg({ tone: 'good', text: `已进入「${r.current?.uname || key}」` })
+          refresh()
+        } catch (e) { setMsg({ tone: 'warn', text: '切台失败：' + (e?.message || e) }) } finally { setBusy('') }
+      }
+
       const cur = st.current
       const tone = !st.config.enabled ? 'idle' : cur ? 'live' : 'idle'
       const pillText = !st.config.enabled ? '已关闭' : !st.loggedIn ? '未登录' : cur ? '在看直播' : '守候中'
@@ -537,7 +564,21 @@ window.__ModuleLoader__.load({
               try { const r = await jpost('/tick'); setSt((s) => ({ ...s, current: r.current })); setMsg({ tone: 'good', text: r.current ? '已进入直播间' : '现在没有主播在播' }); refresh() } catch (e) { setMsg({ tone: 'warn', text: '检查失败：' + (e?.message || e) }) } finally { setBusy('') }
             } }, busy === 'tick' ? '检查中…' : '立即检查一次'),
             h('button', { 'data-bl-btn': '', onClick: () => setLogOpen((v) => !v) }, logOpen ? '收起日志' : '看运行日志'),
-            cur ? h('a', { 'data-bl-btn': '', href: cur.url, target: '_blank', rel: 'noreferrer', style: { textDecoration: 'none' } }, '去直播间') : null)),
+            cur ? h('a', { 'data-bl-btn': '', href: cur.url, target: '_blank', rel: 'noreferrer', style: { textDecoration: 'none' } }, '去直播间') : null),
+          /* ── 手动切台 ── */
+          h('div', { 'data-bl-row': '', style: { marginTop: '8px' } },
+            h('button', { 'data-bl-btn': '', disabled: busy === 'switch', onClick: switchRandom },
+              busy === 'switch' ? '换台中…' : '换个随机直播间'),
+            h('div', { 'data-bl-grow': '' },
+              h('input', {
+                'data-bl-input': '', value: switchKey, placeholder: '房间号或主播 UID',
+                onChange: (e) => setSwitchKey(e.target.value),
+                onKeyDown: (e) => { if (e.key === 'Enter') switchTo() },
+              })),
+            h('button', { 'data-bl-btn': '', disabled: busy === 'switchTo', onClick: switchTo },
+              busy === 'switchTo' ? '进入中…' : '进这个直播间')),
+          h('div', { 'data-bl-note': '', style: { marginTop: '6px' } },
+            '手动切进去的也算随机巡场：照样打分，看满上面设定的时长也照样换台。想一直看某个人，就把他加进关注名单并打开优先级。')),
         msg ? h('div', { 'data-bl-msg': '', 'data-good': msg.tone === 'good' ? '' : undefined, 'data-warn': msg.tone === 'warn' ? '' : undefined }, msg.text) : null,
         h('div', { 'data-bl-note': '', style: { marginTop: '8px' } },
           '下面的设置改完不会立刻生效，要滚到页面最底部点一次「保存全部设置」（只有开关类会即时生效）。'),
@@ -814,6 +855,14 @@ window.__ModuleLoader__.load({
               on: form.priorityEnabled !== false,
               onChange: (v) => save({ priorityEnabled: v }, v ? '已启用关注名单' : '已暂停名单，改随机巡场'),
             }),
+            h(ToggleRow, {
+              label: '名单里全都没在播时，也去随机逛',
+              note: form.randomWhenNoneLive === false
+                ? '已关闭：上面这些主播一个都没开播时，就守着等他们，不会进别人的直播间'
+                : '打开时：上面这些主播一个都没在播，就按喜好关键词随机进一个直播间看；名单里有人开播了会切回去',
+              on: form.randomWhenNoneLive !== false,
+              onChange: (v) => save({ randomWhenNoneLive: v }, v ? '已开启：名单没人播时随机逛' : '已关闭：没人播就等着'),
+            }),
             h('div', { 'data-bl-note': '', style: { margin: '6px 0 4px' } }, '喜好关键词（逗号分隔，随机巡场时优先挑标题/主播名命中的）'),
             h('input', {
               // 非受控：受控时每次 onChange 都会把数组 join 回去覆盖输入框，
@@ -834,18 +883,32 @@ window.__ModuleLoader__.load({
                   value: Math.round((form.randomWatchMs ?? 1_800_000) / 60_000),
                   onChange: (e) => setForm((f) => ({ ...f, randomWatchMs: Math.min(240, Math.max(1, Number(e.target.value) || 30)) * 60_000 })),
                 }))),
-            h('div', { 'data-bl-note': '', style: { opacity: 0.75 } }, '看满就走：先给这位打分、写笔记，再随机挑下一个。关注名单里的主播不受影响。'))),
+            h('div', { 'data-bl-note': '', style: { opacity: 0.75 } }, '看满就走：先给这位打分、写笔记，再随机挑下一个。关注名单里的主播不受影响。改这个数字对正在看的那一场也立刻生效——调小到已经看过的时长就直接换台，不用等下一场。'))),
 
         /* ── 主播评分 ── */
         h('div', { 'data-bl-sec': '' },
           h('div', { 'data-bl-h': '' }, '主播评分'),
-          h('div', { 'data-bl-note': '' }, '看满时长后给主播打分（满分 10）：同接、发言人数、弹幕密度、月投稿数、付费、获赞率、大航海、互动率八项，各自按量级归一后加权。分数会写进直播笔记。随机巡场和关注名单里的主播都会打分，区别在推送——只有随机巡场进来的、分数超过下面那条线的才发私信；关注的主播是特意守的，分数只留在笔记里。'),
           h(ToggleRow, {
             label: '下播后给主播打分',
             note: '关掉就不算分，也不会有高分推送',
             on: form.ratingEnabled !== false,
             onChange: (v) => save({ ratingEnabled: v }, v ? '已开启打分' : '已关闭打分'),
           }),
+          h(ToggleRow, {
+            label: h('span', {},
+              '审核恶意内容（实验性功能）',
+              h('span', { style: { color: '#e5484d', fontWeight: 600 } }, '（慎开）')),
+            note: '弹幕里出现带节奏、网暴、粗鄙语言，超过下面的条数就扣分（最多 5 分）；本场只要有封禁（房管或主播封过人），就一律不扣分——接口不给封禁原因，分不清封的是恶意弹幕还是刷广告的，所以碰到「弹幕确实脏、但有人封过」时，大肥鱼会在评价里如实交代一句：看到了不干净的内容，但现场已经处理，这次先不扣分。判定前会先分清是开玩笑还是真恶意，拿不准的不算。需要扣分时只写在评分日志和笔记的算式里，不会出现在直播总结正文中',
+            on: form.moderationEnabled !== false,
+            onChange: (v) => save({ moderationEnabled: v }, v ? '已开启恶意内容审核' : '已关闭恶意内容审核'),
+          }),
+          h('div', { 'data-bl-row': '' },
+            h('div', { 'data-bl-grow': '' },
+              h('div', { 'data-bl-note': '' }, '恶意弹幕条数达到多少开始扣分'),
+              h('input', {
+                'data-bl-input': '', 'data-bl-num': '', value: form.moderationThreshold ?? 10,
+                onChange: (e) => setForm((f) => ({ ...f, moderationThreshold: Math.min(60, Math.max(3, Number(e.target.value) || 10)) })),
+              }))),
           h('div', { 'data-bl-row': '' },
             h('div', { 'data-bl-grow': '' },
               h('div', { 'data-bl-note': '' }, '多少分以上私信推送'),

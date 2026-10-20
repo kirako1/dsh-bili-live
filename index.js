@@ -29,6 +29,9 @@ import {
   getRandomLiveRooms,
   getRoomByUid,
   getRoomInfo,
+  isOwnMedal,
+  parseBlockEvent,
+  parseInteractWord,
   sendDanmaku,
   sendPrivateMsg,
 } from './lib/live.mjs'
@@ -41,6 +44,7 @@ import { VisionTap } from './lib/vision.mjs'
 import { AsrWorker, findPython } from './lib/asr.mjs'
 import { clearRoomTmp, mb, sweepTmp } from './lib/cleanup.mjs'
 import { collectStats, computeScore, scoreTier, buildWeights } from './lib/rating.mjs'
+import { makeModerator } from './lib/moderation.mjs'
 
 export const name = 'bili-live'
 export const inject = ['webServer']
@@ -168,6 +172,8 @@ export function apply(ctx) {
 
   /* ── 借宿主的模型说人话（拿不到就退化成本地统计） ── */
   const llm = makeLlm(ctx, cfg)
+  // 恶意内容审核（隐藏项）：结算时单独问一次模型，失败就不扣分
+  const moderator = makeModerator(llm, cfg, (m) => log(m))
   const qrLibFile = join(pluginDir, 'vendor', 'qrcode.js')
 
   /* ── 运行时 ── */
@@ -213,10 +219,17 @@ export function apply(ctx) {
           const cur = rt.rating
           if (!cur) return
           const b = cur.best
+          // 开场关注数要单独记一份：best 里存的是峰值，增量得用「峰值 − 开场」
+          if (cur.firstAttn == null && s.attention) cur.firstAttn = s.attention
+          // 粉丝团人数同理：开播那一次采到的当基准，结束时拿最后一次采到的，相减就是本场新增
+          if (cur.firstFansClub == null && s.fansClub) cur.firstFansClub = s.fansClub
+          if (s.fansClub) cur.lastFansClub = s.fansClub
           cur.best = {
             online: Math.max(b?.online || 0, s.online),
+            // 任何一次采样采到了同接，这一场就算「已知」——不要求最后一次也成功
+            onlineKnown: Boolean(s.onlineKnown || b?.onlineKnown),
             attention: Math.max(b?.attention || 0, s.attention),
-            follower: Math.max(b?.follower || 0, s.follower),
+            follower: Math.max(b?.follower || 0, s.follower || 0),
             likes: Math.max(b?.likes || 0, s.likes),
             likesPerVideo: s.likesPerVideo || b?.likesPerVideo || 0,
             // 投稿频率是账号属性，不随采样涨落，取最近一次采到的值
@@ -224,6 +237,10 @@ export function apply(ctx) {
             videoCount: s.videoCount || b?.videoCount || 0,
             popularity: Math.max(b?.popularity || 0, s.popularity),
             payerCount: Math.max(b?.payerCount || 0, s.payerCount),
+            // 付费人数、粉丝付费、路人付费必须取自同一次采样，否则分子分母对不上。
+            // 这次采到的付费人数不比上次少，就以这次为准
+            payerFans: (s.payerCount || 0) >= (b?.payerCount || 0) ? s.payerFans || 0 : b?.payerFans || 0,
+            payerStrangers: (s.payerCount || 0) >= (b?.payerCount || 0) ? s.payerStrangers || 0 : b?.payerStrangers || 0,
             guardCount: Math.max(b?.guardCount || 0, s.guardCount),
             upUid: s.upUid || b?.upUid || '',
             area: s.area || b?.area || '',
@@ -237,12 +254,16 @@ export function apply(ctx) {
     if (rt.rating.timer.unref) rt.rating.timer.unref()
   }
 
-  /** 停采样，把这一场采到的最好成绩交出去 */
+  /** 停采样，把这一场采到的最好成绩交出去（顺便带上开场关注数，算增量要用） */
   const stopRating = () => {
     const r = rt.rating
     if (r?.timer) clearInterval(r.timer)
     rt.rating = null
-    return r?.best || null
+    if (!r?.best) return null
+    // 本场新增粉丝团成员 = 结束时的人数 − 开播时的人数（退团的会是负数，按 0 记）
+    const fanGain =
+      r.firstFansClub != null && r.lastFansClub != null ? Math.max(0, r.lastFansClub - r.firstFansClub) : 0
+    return { ...r.best, firstAttn: r.firstAttn ?? null, fansClub: r.lastFansClub ?? 0, fanGain }
   }
 
   /**
@@ -284,7 +305,7 @@ export function apply(ctx) {
     const prompt = [
       '你刚看完一场 B站 直播。',
       `主播：${rec.uname || '未知'}；分区：${s.area || '未知'}；标题：${rec.title || '（没写）'}；`,
-      `这一场：在线 ${s.online || 0} 人、月投稿 ${s.posts30d || 0} 条、获赞率 ${s.likesPerVideo || 0}/稿、付费 ${s.payerCount || 0} 人、大航海 ${s.guardCount || 0} 位、${rating.speakers || 0} 人开口说话、每分钟 ${rating.dpm} 条弹幕，机器评分 ${rating.score}/10。`,
+      `这一场：在线 ${s.onlineKnown ? s.online : '未知'} 人、月投稿 ${s.posts30d || 0} 条、获赞率 ${s.likesPerVideo || 0}/稿（满分线 ${Math.round(rating.likeCap)}）、付费 ${s.payerCount || 0} 人（其中路人 ${s.payerStrangers || 0} 人、自家粉丝 ${s.payerFans || 0} 人）、大航海 ${s.guardCount || 0} 位、${rating.speakers || 0} 人开口说话、每分钟 ${rating.dpm} 条弹幕，机器评分 ${rating.score}/10。`,
       summary ? `现场记录：${summary}` : '',
       '',
       '写两小段，各一到两句，用中文：',
@@ -331,7 +352,7 @@ export function apply(ctx) {
       `【直播评分 ${rating.score}/10 · ${rating.tier.tier} 档】`,
       `${rec.uname || '未知主播'}｜${s.area || '未知分区'}`,
       s.online
-        ? `在线 ${s.online} 人 · 月投稿 ${s.posts30d} 条 · 获赞率 ${s.likesPerVideo}/稿 · 大航海 ${s.guardCount} 位 · 这场 ${rating.speakers} 人开口说话`
+        ? `在线 ${s.online} 人 · 月投稿 ${s.posts30d} 条 · 获赞率 ${s.likesPerVideo}/稿 · 大航海 ${s.guardCount} 位 · 付费 ${s.payerCount} 人（路人 ${s.payerStrangers || 0}）· 这场 ${rating.speakers} 人开口说话`
         : '',
       rec.title ? `标题：${rec.title}` : '',
       '',
@@ -352,6 +373,11 @@ export function apply(ctx) {
     log(r.ok ? `高分已推送给 ${toUid}：「${rec.uname}」${rating.score} 分` : `高分推送失败：${r.message}`)
   }
 
+  // 评分门槛：同接低于这个数就整场不打分（用户 m06239 定 30，m06298 改 20）。
+  // 20 人以下的比率类维度（观众参与、粉丝浓度、两个付费率）分母太小，
+  // 一两个人就能顶满，分数会被噪声主导。
+  const MIN_ONLINE = 20
+
   /**
    * 一场直播收尾：评分 → 写笔记 → 高分推送 → 清理中间文件。
    * 不阻塞主流程 —— 调用方不 await 这个函数。
@@ -361,19 +387,75 @@ export function apply(ctx) {
 
     // ① 评分：不管笔记写不写都算，面板要显示
     let rating = null
+    // 审核结果要留到写总结时用（waived 时得在评价里交代一句），所以提到外面
+    let mod = null
     const liveSec = Math.max(0, (rec.endedAt - rec.startedAt) / 1000)
     if (cfg.ratingEnabled && sample && liveSec < 60) {
       // 看得太短就换台（比如被优先级主播挤掉）时样本不够，分数会失真，干脆不打
       log(`这场只看了 ${Math.round(liveSec)} 秒，样本太少，不打分`)
+    } else if (cfg.ratingEnabled && sample && !sample.onlineKnown) {
+      // 同接是大多数人均维度的分母。拿不到时 computeScore 会退到 crowd=30 / heads=5 的保底值，
+      // 20 个人发言就顶到 400% 直接封顶——「因为没数据反而拿满分」，比不打分更糟。
+      log('这场没采到同接人数（付费榜接口没返回 onlineNum），人数类维度的分母会失真，这场不打分')
+    } else if (cfg.ratingEnabled && sample && sample.online < MIN_ONLINE) {
+      // 20 人以下的房间不评。个位数同接时任何小分母比率都会被放大——实测 8 人房 3 人开口
+      // （37%）就顶满观众参与、2 个粉丝付费（25%）就顶满粉丝付费率，总分 8.1 A，
+      // 和 1871 人、290 人发言、354 人付费的房间只差 1.5 分。样本太小，分数没有意义。
+      log(`这场同接只有 ${sample.online} 人（低于 ${MIN_ONLINE}），比率类维度会被小分母放大，不打分`)
     } else if (cfg.ratingEnabled && sample) {
       const minutes = Math.max(1, liveSec / 60)
       const dpm = Math.round((rec.size / minutes) * 10) / 10
       const speakers = rec.speakers()
-      const { score, parts } = computeScore({ ...sample, dpm, speakers }, buildWeights(cfg.ratingWeights))
-      rating = { score, parts, dpm, speakers, tier: scoreTier(score), sample }
-      log(
-        `本场评分 ${score}/10（${rating.tier.tier} 档）：同接 ${sample.online}、${speakers} 人发言、每分钟 ${dpm} 条弹幕、月投稿 ${sample.posts30d}、获赞率 ${sample.likesPerVideo}/稿、付费 ${sample.payerCount}、大航海 ${sample.guardCount}`,
+      // 自家粉人数：弹幕和进房事件里挂着本房牌子的人（两边去重后的并集）
+      const fansPresent = rec.fansPresent
+      // 本场出现过的总人数（含挂牌的）：粉丝浓度的分母，和挂牌人数同量纲
+      const seenCount = rec.seenCount
+      // 本场新增关注：关注数只增不减，用「结束值 − 开场值」；没采到开场值就不算
+      const attentionGain = sample.firstAttn == null ? 0 : Math.max(0, (sample.attention || 0) - sample.firstAttn)
+      // 本场新增粉丝团成员：开播/下播两次采样 fansclub 的差（见 stopRating），路人转化的真实口径
+      const fanGain = Number(rec.fanGain) || 0
+      const { score, parts, likeCap } = computeScore(
+        { ...sample, dpm, speakers, fansPresent, seenCount, attentionGain, fanGain },
+        buildWeights(cfg.ratingWeights),
       )
+      // likeCap 一定要带出来：它是按粉丝数现算的获赞满分线，日志和评价 prompt 都要用它，
+      // 漏了会打成「满分 NaN」（2026-10-20 实测事故）
+      rating = { score, parts, likeCap, dpm, speakers, fansPresent, attentionGain, fanGain, tier: scoreTier(score), sample }
+
+      // ①.5 恶意内容审核（隐藏项）：判完再定最终分。它不参与写总结，所以总结正文
+      // 不会提到扣分；只有下面两行日志和笔记里的算式会说。
+      mod = await moderator.judge(rec)
+      if (mod && (mod.penalty || mod.bonus)) {
+        const final = Math.min(10, Math.max(0, Math.round((score - mod.penalty + mod.bonus) * 10) / 10))
+        rating.rawScore = score
+        rating.score = final
+        rating.mod = mod
+        rating.tier = scoreTier(final)
+      }
+
+      // 期望值归一之后，「补正 ×N」那套说法没意义了：现在每项都显示「这场是同规模平均水平的几倍」，
+      // 四舍五入到两位，能直接看出这个主播相对同行强在哪、弱在哪
+      const expLine = ['interaction', 'speakerRate', 'fansPayRate', 'strangerPayRate']
+        .map((k) => rating.parts?.[k])
+        .filter((p) => p && p.ratio > 0)
+        .map((p) => `${p.label} ×${p.ratio.toFixed(2)}`)
+        .join('、')
+      log(
+        `本场评分 ${rating.score}/10（${rating.tier.tier} 档）：同接 ${sample.online}、${speakers} 人发言、全场挂牌 ${fansPresent} 人、每分钟 ${dpm} 条弹幕、新增粉丝团 ${fanGain} 人（涨粉 ${attentionGain}）、月投稿 ${sample.posts30d}、获赞率 ${sample.likesPerVideo}/稿（满分 ${Math.round(rating.likeCap)}）、付费 ${sample.payerCount}（路人 ${sample.payerStrangers || 0}、自己人 ${sample.payerFans || 0}）、大航海 ${sample.guardCount}${expLine ? `｜相对同规模：${expLine}` : ''}`,
+      )
+      if (rating.mod) {
+        const m = rating.mod
+        const sign = `${m.penalty ? ` − ${m.penalty}` : ''}${m.bonus ? ` + ${m.bonus}` : ''}`
+        log(
+          `权重分 ${rating.rawScore}${sign} = ${rating.score} 分（${rating.tier.tier} 档）｜恶意内容估算 ${m.malicious} 条${m.blocks ? `、封禁 ${m.blocks} 次` : ''}${m.samples.length ? `｜示例「${m.samples[0]}」` : ''}`,
+        )
+      } else if (mod && mod.blocked) {
+        log(
+          `恶意内容审核：本场有 ${mod.blocks} 次封禁，已制止过，不扣分（估算 ${mod.malicious} 条）${mod.waived ? '，会在评价里说明' : ''}`,
+        )
+      } else if (mod && mod.malicious) {
+        log(`恶意内容审核：估算 ${mod.malicious} 条，没到 ${mod.threshold} 条扣分线`)
+      }
     }
 
     let summary = ''
@@ -386,10 +468,20 @@ export function apply(ctx) {
       if (llm.available) {
         const said = cfg.audioInRecap ? rec.speechDigest(40) : ''
         const frames = cfg.visionInRecap ? await shotRefs(shots, cfg.visionShotsInRecap) : []
+        // 时段必须显式喂给模型：只写「时长 5 分钟」时，它会拿「肚子饿、点外卖、店12点才开」
+        // 这类内容线索自己脑补成「深夜随便开播的杂谈局」——下午 5 点的直播就这么写歪了。
+        const hhmm = (ts) => {
+          const d = new Date(ts)
+          return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+        }
+        const startD = new Date(rec.startedAt)
+        const startH = startD.getHours()
+        const dayPart = startH < 6 ? '凌晨' : startH < 11 ? '上午' : startH < 14 ? '中午' : startH < 18 ? '下午' : startH < 23 ? '晚上' : '深夜'
+        const dateStr = `${startD.getMonth() + 1}月${startD.getDate()}日`
         const prompt = [
           `这是一场 B站 直播的现场记录。`,
           `主播：${rec.uname || '未知'}；直播标题：${rec.title || '（没写）'}；`,
-          `时长：${Math.max(1, Math.round((rec.endedAt - rec.startedAt) / 60000))} 分钟；弹幕共 ${rec.size} 条，${rec.speakers()} 人发言${rec.speechSize ? `；本机还转写出主播说的 ${rec.speechSize} 段话` : ''}。`,
+          `时间：${dateStr} ${hhmm(rec.startedAt)} ~ ${hhmm(rec.endedAt)}（${dayPart}）；时长：${Math.max(1, Math.round((rec.endedAt - rec.startedAt) / 60000))} 分钟；弹幕共 ${rec.size} 条，${rec.speakers()} 人发言${rec.speechSize ? `；本机还转写出主播说的 ${rec.speechSize} 段话` : ''}。`,
           rating ? `机器给这场直播打的分是 ${rating.score}/10（同接 ${rating.sample.online}、月投稿 ${rating.sample.posts30d}、大航海 ${rating.sample.guardCount}）。` : '',
           '',
           frames.length ? `下面附了 ${frames.length} 张这场直播的画面截图（按时间先后），可以结合画面说画面上在做什么。` : '',
@@ -401,7 +493,11 @@ export function apply(ctx) {
           '',
           '请用 100~180 个中文字，简单介绍一下这场直播大概发生了什么：聊了什么话题、气氛怎么样、有没有反复出现的事（比如抽奖、连麦、打游戏、唱歌）。',
           '然后另起一行写「【大肥鱼的评价】」，再用 60~120 字写你自己的看法：这场值不值得看、主播是什么路数、你看着是什么感觉。可以主观、可以说人话，像跟朋友聊，但必须贴着上面的记录，别编。',
+          mod?.waived
+            ? `【这场有个特殊情况，必须写进评价】这场有 ${mod.blocks} 次封禁，同时弹幕里能看到大约 ${mod.malicious} 条明显带节奏、骂人或引战的内容。但 B站 的封禁记录只说封了谁，不说为什么封——所以没法确认房管封的是不是这些恶意弹幕，也可能只是封了刷广告刷屏的。请在【大肥鱼的评价】里用一两句自然的话把这事说清楚：这场确实看到了一些不干净的弹幕，不过现场已经有人封禁处理，自己分不清封的是不是这些，所以这次先不扣分——这是能力所限，不是没问题。不要写成免责声明，也不要提「权重」「审核」「模型」这些内部词。`
+            : '',
           '要求：平实具体，不要分点、不要别的小标题、不要客套话、不要编造这儿没出现的内容。',
+          `这场直播实际发生在${dateStr}${dayPart}（${hhmm(rec.startedAt)} 开始）。主播提到吃饭、点外卖、下班、上班这类内容时，按这个真实时段去理解，别自行推断成深夜或凌晨。`,
         ].filter(Boolean).join('\n')
         summary = await llm.generate({
           prompt,
@@ -484,6 +580,8 @@ export function apply(ctx) {
     rt.audio = null
     if (!a) return
     try { a.tap.stop() } catch { /* 收摊 */ }
+    // 旧房间还在排队的转写全部作废，别让 worker 继续嚼已经删掉的切片
+    try { rt.asr?.cancelPending(why) } catch { /* 收摊 */ }
     log(`停止听声音（${why}）`)
   }
 
@@ -623,12 +721,18 @@ export function apply(ctx) {
       return
     }
     try {
-      const r = await ensureAsr().transcribe(seg.file, { lang: cfg.asrLang || 'auto' })
+      const r = await ensureAsr().transcribe(seg.file, {
+        lang: cfg.asrLang || 'auto',
+        // 给这一片 3 倍切片时长的预算：15 秒的片最多等 45 秒。超了就丢，别拖垮后面的
+        timeoutMs: Math.max(45_000, Math.round(Number(cfg.audioSliceMs || 15_000) * 3)),
+      })
       if (rt.audio === a) {
         a.transcribed += 1
         a.chars += r.text.length
         if (r.text) a.lastText = r.text
       }
+      // 转写恢复正常后清掉陈旧的报错，别让面板一直挂着历史错误
+      if (rt.lastError && String(rt.lastError).startsWith('转写失败')) rt.lastError = ''
       if (r.text) {
         const rec = rt.recorder
         if (rec) rec.addSpeech(r.text)
@@ -636,8 +740,26 @@ export function apply(ctx) {
       }
     } catch (e) {
       if (rt.audio === a) a.dropped += 1
-      rt.lastError = `转写失败：${e?.message || e}`
+      const why = e?.message || String(e)
+      // 切台时旧切片已被清掉、或队列主动丢弃：这是正常现象，不算故障
+      if (/找不到音频文件|积压过多|取消这段转写/.test(why)) { log(`跳过一段转写：${why}`); return }
+      rt.lastError = `转写失败：${why}`
       log(rt.lastError)
+      // 连续超时 = 这台机器带不动当前模型：自动退回 small，别一直雪崩
+      if (/超时/.test(why)) {
+        rt.asrTimeouts = (Number(rt.asrTimeouts) || 0) + 1
+        const curModel = String(cfg.asrModel || 'small')
+        if (rt.asrTimeouts >= 3 && curModel !== 'small') {
+          rt.asrTimeouts = 0
+          cfg.asrModel = 'small'
+          saveCfg()
+          try { rt.asr?.stop() } catch { /* 收摊 */ }
+          rt.asr = null
+          log(`连续 3 次转写超时：${curModel} 在这台机器上跑不动，已自动降为 small（设置页可以改回来）`)
+        }
+      } else {
+        rt.asrTimeouts = 0
+      }
     } finally {
       if (!cfg.audioKeepFiles) { try { unlinkSync(seg.file) } catch { /* 忽略 */ } }
     }
@@ -783,6 +905,31 @@ export function apply(ctx) {
     void info
   }
 
+  /** 巡场看够了：收摊、写笔记打分，再让 tick 挑下一个 */
+  const rotateNow = () => {
+    const mins = Math.round(Math.max(60_000, Number(cfg.randomWatchMs) || 1_800_000) / 60_000)
+    log(`在「${rt.current?.uname || '这个直播间'}」巡场看够 ${mins} 分钟，换下一个直播间`)
+    stopWatching(`巡场看满 ${mins} 分钟`)
+    tick().catch(() => {})
+  }
+
+  /**
+   * 按「当前设定」重设换台倒计时，起点是本场进房时刻。
+   * 关键：改设置也算数 —— 把时长调小，这一场会立刻按新值判断（已超就当场换）；
+   * 调大则重新等够新时长。只在随机巡场且正在看时才有效。
+   */
+  const armRotateTimer = () => {
+    clearTimeout(rt.rotateTimer)
+    rt.rotateTimer = null
+    if (!rt.current?.random) return
+    const wantMs = Math.max(60_000, Number(cfg.randomWatchMs) || 1_800_000)
+    const watchedMs = Date.now() - (Number(rt.current.since) || Date.now())
+    const leftMs = wantMs - watchedMs
+    if (leftMs <= 0) { rotateNow(); return }
+    rt.rotateTimer = setTimeout(rotateNow, leftMs)
+    if (rt.rotateTimer.unref) rt.rotateTimer.unref()
+  }
+
   /** 开始看某个直播间。opts.random = 随机巡场进来的（会评分、到点换台） */
   const watch = async (stream, info, opts) => {
     const realRoomId = info.realRoomId || info.roomId || Number(stream.roomId) || 0
@@ -797,15 +944,34 @@ export function apply(ctx) {
       title: info.title || '',
       startedAt: Date.now(),
     })
-    const client = new DanmakuClient({
+    // 自家粉计数：弹幕和进房事件里都带粉丝牌，谁先看到就先记，最后去重
+    const upUidNow = String(info.uid || stream.mid || '')
+    const noteMedal = (medal, uid) => {
+      if (!uid) return
+      // 出现即记一笔：粉丝浓度的分母要用「本场出现过的总人数」，和挂牌人数同量纲
+      recorder.noteSeenUid(uid)
+      if (isOwnMedal(medal, realRoomId, upUidNow)) recorder.noteMedalUid(uid)
+    }
+    let client
+    client = new DanmakuClient({
       roomId: realRoomId,
       cred,
       onDanmaku: (d) => {
         rt.danmakuCount += 1
+        noteMedal(d.medal, d.uid)
         if (rt.recorder === recorder) recorder.push(d)
         handleDanmaku(d, realRoomId, info).catch(() => {})
       },
-      onStatus: (s) => { if (rt.current) rt.current.status = s },
+      // 进房/关注事件：只关心「这个人挂的谁家牌子」，用来算粉丝浓度
+      onEvent: (msg) => {
+        const ev = parseInteractWord(msg)
+        if (ev) { noteMedal(ev.medal, ev.uid); return }
+        // 封禁/禁言：只当「有没有人管」的佐证，给恶意内容审核用
+        const blk = parseBlockEvent(msg)
+        if (blk) recorder.noteBlock(blk)
+      },
+      // 只更新「属于这个连接」的房间状态：旧连接晚到的回调不能改新房间的显示
+      onStatus: (s) => { if (rt.current && rt.current.client === client) rt.current.status = s },
       onLog: (m) => log(m),
     })
     rt.recorder = recorder
@@ -830,15 +996,36 @@ export function apply(ctx) {
     startRating(realRoomId, info.uid || stream.mid || '', cred)
     if (opts?.random) {
       // 看够 randomWatchMs 就收摊换人：先结这场（写笔记+评分），再让 tick 挑下一个
-      const watchMs = Math.max(60_000, Number(cfg.randomWatchMs) || 1_800_000)
-      clearTimeout(rt.rotateTimer)
-      rt.rotateTimer = setTimeout(() => {
-        const mins = Math.round(watchMs / 60_000)
-        log(`在「${info.uname || stream.name}」看满 ${mins} 分钟，换下一个直播间`)
-        stopWatching(`巡场看满 ${mins} 分钟`)
-        tick().catch(() => {})
-      }, watchMs)
+      armRotateTimer()
     }
+  }
+
+  /**
+   * 随机巡场：按喜好关键词挑一个「此刻正在播」的房间进去。
+   * 已经随机在看时直接返回（不每轮换台）；在优先级房间里则先收摊（照常写笔记）。
+   * reason 只用于日志/收摊原因。返回 true 表示现在确实在一个随机房间里。
+   */
+  const randomTour = async (cred, reason, opts) => {
+    if (rt.current?.random && !opts?.force) return false // 已经在随机看的房间里，别每轮换台
+    if (rt.current) stopWatching(reason)
+    const rooms = await getRandomLiveRooms(cred, { want: 60, keywords: cfg.randomKeywords })
+    if (!rooms.length) { stopWatching('没找到正在播的直播间'); return false }
+    // 命中喜好关键词的优先；一个都没命中就退回纯随机（不干待着）
+    const matched = rooms.filter((r) => r.matched)
+    const others = rooms.filter((r) => !r.matched)
+    const recent = rt.recentRooms || []
+    const notSeen = (list) => list.filter((r) => !recent.includes(String(r.roomId)))
+    // 三层兜底：没看过的命中房 → 没看过的其他房 → 实在没得挑才回到看过的
+    let pool = notSeen(matched)
+    if (!pool.length) pool = notSeen(others)
+    if (!pool.length) pool = matched.length ? matched : rooms
+    const pick = pool[Math.floor(Math.random() * pool.length)]
+    rt.recentRooms = [String(pick.roomId), ...recent.filter((x) => x !== String(pick.roomId))].slice(0, 12)
+    const info2 = await getRoomInfo(pick.roomId, cred)
+    if (Number(info2.liveStatus) !== 1) { stopWatching('随机到的房间刚好没在播'); return false }
+    log(`${reason}，随机逛进「${pick.uname}」（${pick.roomId}，人气 ${pick.online}${pick.matched ? '，命中喜好' : ''}）`)
+    await watch({ name: pick.uname, mid: pick.mid, roomId: pick.roomId }, info2, { random: true })
+    return true
   }
 
   /** 一次检查：按优先级找第一个开播的 */
@@ -862,34 +1049,23 @@ export function apply(ctx) {
       }
       rt.myUid = String(cred.dedeuserid || '')
 
+      // 兜底换台：定时器可能被系统睡眠/异常打断，每轮按「进房时刻 + 当前设定」再核一次
+      if (rt.current?.random) {
+        const wantMs = Math.max(60_000, Number(cfg.randomWatchMs) || 1_800_000)
+        const watchedMs = Date.now() - (Number(rt.current.since) || Date.now())
+        if (watchedMs >= wantMs) {
+          const mins = Math.round(wantMs / 60_000)
+          log(`在「${rt.current.uname}」已看 ${Math.round(watchedMs / 60_000)} 分钟（设定 ${mins} 分钟），换下一个直播间`)
+          stopWatching(`巡场看满 ${mins} 分钟`)
+        }
+      }
+
       // 优先级关掉时不看名单（名单内容原样保留），直接走随机巡场
       const usePriority = cfg.priorityEnabled !== false
       const targets = usePriority ? cfg.streams.filter((s) => s.enabled !== false) : []
       if (!targets.length) {
         // 随机巡场：常开。没启用优先级、或名单是空的，都会走到这里
-        if (rt.current?.random) return // 已经在随机看的房间里，别每轮换台
-        // 现在可能还守在优先级房间里：先收摊（照常写笔记），再去挑随机房间
-        if (rt.current) stopWatching('优先级关着，改随机巡场')
-        const rooms = await getRandomLiveRooms(cred, { want: 24, keywords: cfg.randomKeywords })
-        if (!rooms.length) { stopWatching('没找到正在播的直播间'); return }
-        // 命中喜好关键词的优先；一个都没命中就退回纯随机（不干待着）
-        const matched = rooms.filter((r) => r.matched)
-        const others = rooms.filter((r) => !r.matched)
-        const recent = rt.recentRooms || []
-        const notSeen = (list) => list.filter((r) => !recent.includes(String(r.roomId)))
-        // 三层兜底：没看过的命中房 → 没看过的其他房 → 实在没得挑才回到看过的
-        // （只看「命中池」会因为池子太小而反复抽到同一个人）
-        let pool = notSeen(matched)
-        if (!pool.length) pool = notSeen(others)
-        if (!pool.length) pool = matched.length ? matched : rooms
-        const pick = pool[Math.floor(Math.random() * pool.length)]
-        rt.recentRooms = [String(pick.roomId), ...recent.filter((x) => x !== String(pick.roomId))].slice(0, 12)
-        const info2 = await getRoomInfo(pick.roomId, cred)
-        if (Number(info2.liveStatus) !== 1) { stopWatching('随机到的房间刚好没在播'); return }
-        log(
-          `${usePriority ? '没填关注' : '优先级关着'}，随机逛进「${pick.uname}」（${pick.roomId}，人气 ${pick.online}${pick.matched ? '，命中喜好' : ''}）`,
-        )
-        await watch({ name: pick.uname, mid: pick.mid, roomId: pick.roomId }, info2, { random: true })
+        await randomTour(cred, usePriority ? '没填关注' : '优先级关着')
         return
       }
 
@@ -905,6 +1081,11 @@ export function apply(ctx) {
 
       if (!picked) {
         rt.lastError = ''
+        // 关注的主播一个都没在播：按配置转随机巡场（不干等着）
+        if (cfg.randomWhenNoneLive !== false) {
+          await randomTour(cred, '关注的主播都没开播')
+          return
+        }
         stopWatching(rt.recorder ? '主播下播了' : '关注的主播现在都没开播')
         return
       }
@@ -1024,6 +1205,8 @@ export function apply(ctx) {
       saveCfg()
       schedule()
       log('配置已更新')
+      // 巡场途中改了「看多久」：按新时长重设倒计时（调小到已超时 = 当场换台）
+      armRotateTimer()
       if (!cfg.enabled) stopWatching('总开关被关掉')
       else tick().catch(() => {})
       // 听声音 / 看画面的开关变了，要当场跟着启停（不必等下一轮 tick）
@@ -1086,6 +1269,46 @@ export function apply(ctx) {
       // 只是「离开这一场」，不是把总开关关掉 —— 关掉的话下一轮 tick 会直接 return
       stopWatching('手动停止')
       return sendJson(res, 200, { ok: true })
+    }
+
+    if (req.method === 'POST' && path.endsWith('/switch')) {
+      // 手动切台：mode=random 随机换一个；key=房间号或主播 UID 直接进指定直播间
+      const body = await readBody(req)
+      const cred = loadCred()
+      if (!cred) return sendJson(res, 200, { ok: false, error: '没有登录凭证（先在下面扫码登录）' })
+      if (rt.busy) return sendJson(res, 200, { ok: false, error: '正在检查直播间，等一秒再试' })
+      rt.busy = true
+      try {
+        const mode = String(body.mode || '')
+        if (mode === 'random') {
+          await randomTour(cred, '手动换成随机直播间', { force: true })
+          return sendJson(res, 200, { ok: true, current: statusOfCurrent(), lastError: rt.lastError })
+        }
+        const digits = String(body.key || '').replace(/\D/g, '')
+        if (!digits) return sendJson(res, 200, { ok: false, error: '填一个房间号或主播 UID' })
+        // 先当房间号查，查不到再当主播 UID 查（用户通常只记得其中一个）
+        let info = null
+        try { info = await getRoomInfo(digits, cred) } catch { info = null }
+        if (!info || !(info.realRoomId || info.roomId)) {
+          try { info = await getRoomByUid(digits, cred) } catch (e) {
+            return sendJson(res, 200, { ok: false, error: '没找到这个直播间：' + (e?.message || e) })
+          }
+        }
+        const realRoomId = Number(info?.realRoomId || info?.roomId || 0)
+        if (!realRoomId) return sendJson(res, 200, { ok: false, error: '没找到这个直播间' })
+        if (Number(info.liveStatus) !== 1) {
+          return sendJson(res, 200, { ok: false, error: `「${info.uname || digits}」现在没在播` })
+        }
+        stopWatching('手动切到指定直播间')
+        await watch(
+          { name: info.uname, mid: String(info.uid || ''), roomId: String(realRoomId) },
+          info,
+          { random: true }, // 算随机巡场：照样打分，看满设定时长也照样换台
+        )
+        return sendJson(res, 200, { ok: true, current: statusOfCurrent(), lastError: rt.lastError })
+      } finally {
+        rt.busy = false
+      }
     }
 
     /* ── 扫码登录 ── */
