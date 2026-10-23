@@ -413,7 +413,7 @@ export function apply(ctx) {
       // 本场新增关注：关注数只增不减，用「结束值 − 开场值」；没采到开场值就不算
       const attentionGain = sample.firstAttn == null ? 0 : Math.max(0, (sample.attention || 0) - sample.firstAttn)
       // 本场新增粉丝团成员：开播/下播两次采样 fansclub 的差（见 stopRating），路人转化的真实口径
-      const fanGain = Number(rec.fanGain) || 0
+      const fanGain = Number(sample.fanGain) || 0
       const { score, parts, likeCap } = computeScore(
         { ...sample, dpm, speakers, fansPresent, seenCount, attentionGain, fanGain },
         buildWeights(cfg.ratingWeights),
@@ -491,8 +491,8 @@ export function apply(ctx) {
           '弹幕采样（时间 观众：内容）：',
           rec.digest(80),
           '',
-          '请用 100~180 个中文字，简单介绍一下这场直播大概发生了什么：聊了什么话题、气氛怎么样、有没有反复出现的事（比如抽奖、连麦、打游戏、唱歌）。',
-          '然后另起一行写「【大肥鱼的评价】」，再用 60~120 字写你自己的看法：这场值不值得看、主播是什么路数、你看着是什么感觉。可以主观、可以说人话，像跟朋友聊，但必须贴着上面的记录，别编。',
+          '请用 200~300 个中文字，简单介绍一下这场直播大概发生了什么：聊了什么话题、气氛怎么样、有没有反复出现的事（比如抽奖、连麦、打游戏、唱歌）。',
+          '然后另起一行写「【大肥鱼的评价】」，再用 200~300 字写你自己的看法：这场值不值得看、主播是什么路数、你看着是什么感觉。可以主观、可以说人话，像跟朋友聊，但必须贴着上面的记录，别编。',
           mod?.waived
             ? `【这场有个特殊情况，必须写进评价】这场有 ${mod.blocks} 次封禁，同时弹幕里能看到大约 ${mod.malicious} 条明显带节奏、骂人或引战的内容。但 B站 的封禁记录只说封了谁，不说为什么封——所以没法确认房管封的是不是这些恶意弹幕，也可能只是封了刷广告刷屏的。请在【大肥鱼的评价】里用一两句自然的话把这事说清楚：这场确实看到了一些不干净的弹幕，不过现场已经有人封禁处理，自己分不清封的是不是这些，所以这次先不扣分——这是能力所限，不是没问题。不要写成免责声明，也不要提「权重」「审核」「模型」这些内部词。`
             : '',
