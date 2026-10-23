@@ -332,7 +332,7 @@ window.__ModuleLoader__.load({
         ratingEnabled: form.ratingEnabled !== false,
         moderationEnabled: form.moderationEnabled !== false,
         moderationThreshold: Number(form.moderationThreshold) || 10,
-        ratingPushScore: Number(form.ratingPushScore) || 8,
+        ratingPushScore: Math.min(10, Math.max(1, Number(form.ratingPushScore) || 8)),
         ratingPushUid: String(form.ratingPushUid || ''),
         /* 十维评分权重：用户在上面自己填的百分数，必须一起提交 */
         ratingWeights: (() => {
@@ -914,7 +914,7 @@ window.__ModuleLoader__.load({
               h('div', { 'data-bl-note': '' }, '多少分以上私信推送'),
               h('input', {
                 'data-bl-input': '', 'data-bl-num': '', value: form.ratingPushScore ?? 8,
-                onChange: (e) => setForm((f) => ({ ...f, ratingPushScore: Math.min(10, Math.max(1, Number(e.target.value) || 8)) })),
+                onChange: (e) => setForm((f) => ({ ...f, ratingPushScore: e.target.value })),
               })),
             h('div', { 'data-bl-grow': '' },
               h('div', { 'data-bl-note': '' }, '推送给哪个 UID（不能是本账号）'),
